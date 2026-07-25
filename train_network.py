@@ -45,9 +45,13 @@ import library.rms_utils as rms_utils
 from library.rms_step_probe import (
     PIECEWISE_ENERGY_POLICY,
     build_rms_probe_args,
+    choose_adjusted_probe_training_steps,
     choose_gradient_accumulation_steps,
     estimate_piecewise_energy_adjusted_steps,
     estimate_rms_adjusted_steps,
+    fit_observed_later_mean_energy_slope,
+    fit_schedule_aware_probe_energy_model,
+    probe_schedule_needs_adjusted_probe,
     round_steps_to_nearest_multiple,
     validate_rms_probe_configuration,
 )
@@ -606,6 +610,7 @@ class NetworkTrainer:
             "ss_rms_probe_target": args.rms_probe_target,
             "ss_rms_probe_final_target": args.rms_probe_final_target,
             "ss_rms_probe_steps": args.rms_probe_steps,
+            "ss_rms_probe_training_step_limit": getattr(args, "_training_step_limit", None),
             "ss_rms_probe_scaling_policy": args.rms_probe_scaling_policy,
             "ss_rms_probe_curve_every_n_steps": args.rms_probe_curve_every_n_steps,
             "ss_rms_probe_observed": getattr(args, "_rms_probe_observed", None),
@@ -614,6 +619,9 @@ class NetworkTrainer:
             "ss_rms_probe_estimated_max_train_steps": getattr(args, "_rms_probe_estimated_max_train_steps", None),
             "ss_rms_probe_dataset_batches_per_epoch": getattr(args, "_rms_probe_dataset_batches_per_epoch", None),
             "ss_rms_probe_energy_slope": getattr(args, "_rms_probe_energy_slope", None),
+            "ss_rms_probe_later_mean_energy_slope": getattr(
+                args, "_rms_probe_later_mean_energy_slope", None
+            ),
             "ss_rms_probe_gradient_accumulation_target_microbatches": (
                 args.rms_probe_gradient_accumulation_target_microbatches
             ),
@@ -948,9 +956,10 @@ class NetworkTrainer:
             original_args.seed = random.randint(0, 2**32)
         original_steps = original_args.max_train_steps
         probe_args = build_rms_probe_args(original_args)
+        probe_records = []
 
         logger.info(
-            "starting isolated RMS probe: steps=%s, reference_rms=%.8g, production_steps=%s, output_dir=%s",
+            "starting isolated RMS probe 1: steps=%s, reference_rms=%.8g, production_steps=%s, output_dir=%s",
             probe_args.rms_probe_steps,
             probe_args.rms_probe_target,
             original_steps,
@@ -958,34 +967,232 @@ class NetworkTrainer:
         )
         probe_trainer = type(self)()
         probe_result = probe_trainer._train(probe_args)
-        observed_rms = probe_result["total_rms"]
+        probe_records.append(
+            {
+                "probe_index": 1,
+                "configured_max_train_steps": probe_args.max_train_steps,
+                "training_step_limit": probe_args._training_step_limit,
+                "gradient_accumulation_steps": probe_args.gradient_accumulation_steps,
+                "observed_rms": probe_result["total_rms"],
+                "rms_curve": probe_result["rms_curve"],
+                "output_dir": probe_args.output_dir,
+            }
+        )
+        model_reference_rms = probe_result["total_rms"]
         model_details = {}
         if original_args.rms_probe_scaling_policy == PIECEWISE_ENERGY_POLICY:
-            estimated_steps, step_multiplier, model_details = estimate_piecewise_energy_adjusted_steps(
-                original_steps=original_steps,
-                final_target_rms=original_args.rms_probe_final_target,
-                observed_rms=observed_rms,
-                probe_steps=original_args.rms_probe_steps,
-                dataset_batches_per_epoch=probe_result["dataset_batches_per_epoch"],
-                rms_curve=probe_result["rms_curve"],
+            model_gradient_accumulation_steps = min(
+                choose_gradient_accumulation_steps(
+                    original_steps,
+                    original_args.rms_probe_gradient_accumulation_target_microbatches,
+                    original_args.gradient_accumulation_steps,
+                    original_args.rms_probe_min_gradient_accumulation_steps,
+                    original_args.rms_probe_gradient_accumulation_rounding_bias,
+                ),
+                probe_result["dataset_batches_per_epoch"],
             )
+            seen_gradient_accumulations = set()
+            while model_gradient_accumulation_steps not in seen_gradient_accumulations:
+                seen_gradient_accumulations.add(model_gradient_accumulation_steps)
+                estimated_steps, step_multiplier, model_details = (
+                    estimate_piecewise_energy_adjusted_steps(
+                        original_steps=original_steps,
+                        final_target_rms=original_args.rms_probe_final_target,
+                        observed_rms=model_reference_rms,
+                        probe_steps=original_args.rms_probe_steps,
+                        dataset_batches_per_epoch=probe_result["dataset_batches_per_epoch"],
+                        rms_curve=probe_result["rms_curve"],
+                        gradient_accumulation_steps=model_gradient_accumulation_steps,
+                    )
+                )
+                adjusted_steps = round_steps_to_nearest_multiple(
+                    estimated_steps,
+                    original_args.rms_probe_adjusted_steps_divisible_by,
+                )
+                uncapped_adjusted_gradient_accumulation_steps = (
+                    choose_gradient_accumulation_steps(
+                        adjusted_steps,
+                        original_args.rms_probe_gradient_accumulation_target_microbatches,
+                        original_args.gradient_accumulation_steps,
+                        original_args.rms_probe_min_gradient_accumulation_steps,
+                        original_args.rms_probe_gradient_accumulation_rounding_bias,
+                    )
+                )
+                adjusted_gradient_accumulation_steps = min(
+                    uncapped_adjusted_gradient_accumulation_steps,
+                    probe_result["dataset_batches_per_epoch"],
+                )
+                if (
+                    adjusted_gradient_accumulation_steps
+                    == model_gradient_accumulation_steps
+                ):
+                    break
+                model_gradient_accumulation_steps = (
+                    adjusted_gradient_accumulation_steps
+                )
+            else:
+                raise ValueError(
+                    "RMS probe could not find a stable step and gradient-accumulation "
+                    "combination for the augmented energy model"
+                )
         else:
             estimated_steps, step_multiplier = estimate_rms_adjusted_steps(
                 original_steps,
                 original_args.rms_probe_target,
-                observed_rms,
+                model_reference_rms,
             )
-        adjusted_steps = round_steps_to_nearest_multiple(
-            estimated_steps,
-            original_args.rms_probe_adjusted_steps_divisible_by,
-        )
-        adjusted_gradient_accumulation_steps = choose_gradient_accumulation_steps(
-            adjusted_steps,
-            original_args.rms_probe_gradient_accumulation_target_microbatches,
-            original_args.gradient_accumulation_steps,
-            original_args.rms_probe_min_gradient_accumulation_steps,
-            original_args.rms_probe_gradient_accumulation_rounding_bias,
-        )
+            adjusted_steps = round_steps_to_nearest_multiple(
+                estimated_steps,
+                original_args.rms_probe_adjusted_steps_divisible_by,
+            )
+            uncapped_adjusted_gradient_accumulation_steps = (
+                choose_gradient_accumulation_steps(
+                    adjusted_steps,
+                    original_args.rms_probe_gradient_accumulation_target_microbatches,
+                    original_args.gradient_accumulation_steps,
+                    original_args.rms_probe_min_gradient_accumulation_steps,
+                    original_args.rms_probe_gradient_accumulation_rounding_bias,
+                )
+            )
+            adjusted_gradient_accumulation_steps = min(
+                uncapped_adjusted_gradient_accumulation_steps,
+                probe_result["dataset_batches_per_epoch"],
+            )
+        if adjusted_gradient_accumulation_steps < uncapped_adjusted_gradient_accumulation_steps:
+            logger.info(
+                "RMS probe gradient accumulation capped from %s to %s because the dataset "
+                "has %s batches per epoch",
+                uncapped_adjusted_gradient_accumulation_steps,
+                adjusted_gradient_accumulation_steps,
+                probe_result["dataset_batches_per_epoch"],
+            )
+
+        if (
+            original_args.rms_probe_scaling_policy == PIECEWISE_ENERGY_POLICY
+            and probe_schedule_needs_adjusted_probe(adjusted_steps, original_args.rms_probe_steps)
+        ):
+            provisional_steps = adjusted_steps
+            provisional_gradient_accumulation = adjusted_gradient_accumulation_steps
+            first_estimated_steps = estimated_steps
+            first_model_details = dict(model_details)
+            adjusted_probe_training_steps, adjusted_probe_budget_details = (
+                choose_adjusted_probe_training_steps(
+                    reference_probe_steps=original_args.rms_probe_steps,
+                    original_gradient_accumulation_steps=(
+                        original_args.gradient_accumulation_steps
+                    ),
+                    adjusted_gradient_accumulation_steps=(
+                        provisional_gradient_accumulation
+                    ),
+                    production_steps=provisional_steps,
+                    curve_interval=original_args.rms_probe_curve_every_n_steps,
+                )
+            )
+
+            logger.info(
+                "RMS probe 1 selected a schedule with a squeeze in the first %s steps; "
+                "starting adjusted probe 2 for %s steps with max_train_steps=%s, "
+                "gradient_accumulation_steps=%s, nominal_microbatch_budget=%s, "
+                "and selected_nominal_microbatches=%s",
+                original_args.rms_probe_steps,
+                adjusted_probe_training_steps,
+                provisional_steps,
+                provisional_gradient_accumulation,
+                int(adjusted_probe_budget_details["adjusted_probe_nominal_microbatch_budget"]),
+                int(
+                    adjusted_probe_budget_details[
+                        "adjusted_probe_nominal_training_microbatches"
+                    ]
+                ),
+            )
+
+            del probe_trainer
+            strategy_base.reset_strategies()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if hasattr(torch, "xpu") and torch.xpu.is_available() and hasattr(torch.xpu, "empty_cache"):
+                torch.xpu.empty_cache()
+
+            probe_args = build_rms_probe_args(
+                original_args,
+                probe_index=2,
+                production_steps=provisional_steps,
+                gradient_accumulation_steps=provisional_gradient_accumulation,
+                training_step_limit=adjusted_probe_training_steps,
+            )
+            probe_trainer = type(self)()
+            probe_result = probe_trainer._train(probe_args)
+            probe_records.append(
+                {
+                    "probe_index": 2,
+                    "configured_max_train_steps": probe_args.max_train_steps,
+                    "training_step_limit": probe_args._training_step_limit,
+                    "gradient_accumulation_steps": probe_args.gradient_accumulation_steps,
+                    "observed_rms": probe_result["total_rms"],
+                    "rms_curve": probe_result["rms_curve"],
+                    "output_dir": probe_args.output_dir,
+                }
+            )
+
+            model_reference_rms, adjusted_probe_slope, schedule_fit_details = (
+                fit_schedule_aware_probe_energy_model(
+                    probe_result["rms_curve"],
+                    provisional_steps,
+                    original_args.rms_probe_steps,
+                    original_args.rms_probe_curve_every_n_steps,
+                )
+            )
+            observed_later_slope, observed_later_details = fit_observed_later_mean_energy_slope(
+                probe_result["rms_curve"],
+                provisional_steps,
+                adjusted_probe_training_steps,
+                model_reference_rms,
+                original_args.rms_probe_curve_every_n_steps,
+            )
+            estimated_steps, step_multiplier, model_details = estimate_piecewise_energy_adjusted_steps(
+                original_steps=original_steps,
+                final_target_rms=original_args.rms_probe_final_target,
+                observed_rms=model_reference_rms,
+                probe_steps=original_args.rms_probe_steps,
+                dataset_batches_per_epoch=probe_result["dataset_batches_per_epoch"],
+                rms_curve=probe_result["rms_curve"],
+                gradient_accumulation_steps=provisional_gradient_accumulation,
+                probe_energy_slope=adjusted_probe_slope,
+                later_mean_energy_slope=observed_later_slope,
+            )
+            adjusted_steps = round_steps_to_nearest_multiple(
+                estimated_steps,
+                original_args.rms_probe_adjusted_steps_divisible_by,
+            )
+            # Probe 2 is the final probe. Keep its accumulation for production,
+            # even if the second estimate moves the step count across a rounding boundary.
+            adjusted_gradient_accumulation_steps = provisional_gradient_accumulation
+            model_details.update(schedule_fit_details)
+            model_details.update(observed_later_details)
+            model_details.update(adjusted_probe_budget_details)
+            model_details.update(
+                {
+                    "probe_index": 2.0,
+                    "model_reference_rms": model_reference_rms,
+                    "adjusted_probe_max_train_steps": float(provisional_steps),
+                    "adjusted_probe_training_step_limit": float(
+                        adjusted_probe_training_steps
+                    ),
+                    "adjusted_probe_gradient_accumulation_steps": float(
+                        provisional_gradient_accumulation
+                    ),
+                    "first_probe_estimated_max_train_steps": float(first_estimated_steps),
+                    "first_probe_adjusted_max_train_steps": float(provisional_steps),
+                    "first_probe_predicted_final_rms": first_model_details.get(
+                        "predicted_final_rms", original_args.rms_probe_final_target
+                    ),
+                }
+            )
+        else:
+            model_details["probe_index"] = 1.0
+
+        observed_rms = probe_result["total_rms"]
 
         summary = {
             "seed": original_args.seed,
@@ -994,7 +1201,10 @@ class NetworkTrainer:
             "target_rms": original_args.rms_probe_target,
             "final_target_rms": original_args.rms_probe_final_target,
             "observed_rms": observed_rms,
+            "model_reference_rms": model_reference_rms,
             "rms_curve": probe_result["rms_curve"],
+            "selected_probe_index": len(probe_records),
+            "probes": probe_records,
             "step_multiplier": step_multiplier,
             "original_max_train_steps": original_steps,
             "estimated_max_train_steps": estimated_steps,
@@ -1008,6 +1218,12 @@ class NetworkTrainer:
                 original_args.rms_probe_gradient_accumulation_rounding_bias
             ),
             "original_gradient_accumulation_steps": original_args.gradient_accumulation_steps,
+            "uncapped_adjusted_gradient_accumulation_steps": (
+                uncapped_adjusted_gradient_accumulation_steps
+            ),
+            "gradient_accumulation_dataset_batch_cap": probe_result[
+                "dataset_batches_per_epoch"
+            ],
             "adjusted_gradient_accumulation_steps": adjusted_gradient_accumulation_steps,
             "model": model_details,
         }
@@ -1058,6 +1274,9 @@ class NetworkTrainer:
         production_args._rms_probe_estimated_max_train_steps = estimated_steps
         production_args._rms_probe_dataset_batches_per_epoch = probe_result["dataset_batches_per_epoch"]
         production_args._rms_probe_energy_slope = model_details.get("probe_energy_slope_per_1000_steps")
+        production_args._rms_probe_later_mean_energy_slope = model_details.get(
+            "later_mean_energy_slope_per_1000_steps"
+        )
         production_args._rms_probe_original_gradient_accumulation_steps = original_args.gradient_accumulation_steps
         production_args._is_rms_probe_run = False
 
@@ -2338,7 +2557,8 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "after estimating steps, choose gradient accumulation so max_train_steps * "
-            "gradient_accumulation_steps remains near this microbatch budget"
+            "gradient_accumulation_steps remains near this microbatch budget; the result "
+            "is capped at the dataset's batches per epoch"
         ),
     )
     parser.add_argument(
