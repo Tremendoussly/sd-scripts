@@ -53,7 +53,7 @@ from library.rms_step_probe import (
     estimate_piecewise_training_plan,
     estimate_rms_adjusted_steps,
     fit_adjusted_probe_rank36_transfer,
-    fit_observed_later_mean_energy_slope,
+    fit_observed_later_mean_rms_velocity,
     fit_schedule_aware_probe_energy_model,
     round_steps_to_nearest_multiple,
     should_run_adjusted_probe,
@@ -624,8 +624,14 @@ class NetworkTrainer:
             "ss_rms_probe_estimated_max_train_steps": getattr(args, "_rms_probe_estimated_max_train_steps", None),
             "ss_rms_probe_dataset_batches_per_epoch": getattr(args, "_rms_probe_dataset_batches_per_epoch", None),
             "ss_rms_probe_energy_slope": getattr(args, "_rms_probe_energy_slope", None),
-            "ss_rms_probe_later_mean_energy_slope": getattr(
-                args, "_rms_probe_later_mean_energy_slope", None
+            "ss_rms_probe_later_mean_rms_velocity": getattr(
+                args, "_rms_probe_later_mean_rms_velocity", None
+            ),
+            "ss_rms_probe_trajectory_model_version": getattr(
+                args, "_rms_probe_trajectory_model_version", None
+            ),
+            "ss_rms_probe_later_energy_exponent": getattr(
+                args, "_rms_probe_later_energy_exponent", None
             ),
             "ss_rms_probe_gradient_accumulation_target_microbatches": (
                 args.rms_probe_gradient_accumulation_target_microbatches
@@ -1229,7 +1235,10 @@ class NetworkTrainer:
                 first_segment_ratio,
                 final_segment_ratio,
             )
-            observed_later_slope, observed_later_details = fit_observed_later_mean_energy_slope(
+            (
+                observed_later_velocity,
+                observed_later_details,
+            ) = fit_observed_later_mean_rms_velocity(
                 probe_result["rms_curve"],
                 provisional_steps,
                 adjusted_probe_training_steps,
@@ -1275,8 +1284,8 @@ class NetworkTrainer:
                     original_args.rms_probe_adjusted_steps_divisible_by
                 ),
                 probe_energy_slope=transferred_probe_slope,
-                later_mean_energy_slope=observed_later_slope,
-                later_mean_energy_slope_reference_gradient_accumulation_steps=(
+                later_mean_rms_velocity=observed_later_velocity,
+                later_mean_rms_velocity_reference_gradient_accumulation_steps=(
                     provisional_gradient_accumulation
                 ),
                 first_segment_ratio=first_segment_ratio,
@@ -1496,8 +1505,14 @@ class NetworkTrainer:
         production_args._rms_probe_estimated_max_train_steps = estimated_steps
         production_args._rms_probe_dataset_batches_per_epoch = probe_result["dataset_batches_per_epoch"]
         production_args._rms_probe_energy_slope = model_details.get("probe_energy_slope_per_1000_steps")
-        production_args._rms_probe_later_mean_energy_slope = model_details.get(
-            "later_mean_energy_slope_per_1000_steps"
+        production_args._rms_probe_later_mean_rms_velocity = model_details.get(
+            "later_mean_rms_velocity_per_1000_steps"
+        )
+        production_args._rms_probe_trajectory_model_version = model_details.get(
+            "trajectory_model_version"
+        )
+        production_args._rms_probe_later_energy_exponent = model_details.get(
+            "later_energy_exponent"
         )
         production_args._rms_probe_original_gradient_accumulation_steps = original_args.gradient_accumulation_steps
         production_args._is_rms_probe_run = False
@@ -2743,7 +2758,8 @@ def setup_parser() -> argparse.ArgumentParser:
         choices=["linear", "piecewise_energy_v1"],
         help=(
             "step estimation policy: linear preserves the original target/observed scaling; "
-            "piecewise_energy_v1 uses the calibrated Anima 36->9 RMS-squared curve model"
+            "piecewise_energy_v1 uses calibrated rank-36 RMS-squared growth and "
+            "compressed-stage normalized RMS velocity for Anima 36->9"
         ),
     )
     parser.add_argument(

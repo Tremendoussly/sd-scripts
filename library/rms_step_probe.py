@@ -10,37 +10,54 @@ PIECEWISE_ENERGY_POLICY = "piecewise_energy_v1"
 SCALING_POLICIES = (LINEAR_POLICY, PIECEWISE_ENERGY_POLICY)
 CALIBRATION_PROBE_STEPS = 500
 PROBE_ENERGY_FIT_START_STEP = 100
+TRAJECTORY_MODEL_VERSION = 2.0
+LATER_ENERGY_EXPONENT = 0.5
 
-# Calibrated from twenty-one Anima 36->9, four-squeeze runs across M'rissi,
-# Izutsumi, Neeko, Wilykit, Mutio, and Rosine. Rosine has twice the total
-# family weight because its ten runs intentionally span substantial dataset
-# revisions; each other family has one equal share. Repeated runs divide their
-# family's weight. The Rosine revisions had 99, 95, 104, 103, 110, 117, 112,
-# 119, 111, and 103 batches per epoch. The later-stage regression uses
-# standardized inverse batches per epoch, log probe RMS, log production
-# gradient accumulation, and normalized rank-36 probe energy slope.
-# Energy means RMS**2, normalized by the energy measured at the 500-step probe.
-ENERGY_LATER_SLOPE_FEATURE_MEANS = (
-    0.006789925210025811,
-    -10.16875666873536,
-    1.6788450660252974,
-    2.067968411351735,
+# Calibrated from twenty-three Anima 36->9, four-squeeze runs across M'rissi,
+# Izutsumi, Neeko, Wilykit, Mutio, Rosine, and Crossbreed Priscilla. Rosine has
+# twice the total family weight because its ten runs intentionally span
+# substantial dataset revisions; each other family has one equal share.
+# Repeated runs divide their family's weight. The compressed-stage regression
+# uses standardized inverse batches per epoch, log probe RMS, log production
+# gradient accumulation, and normalized rank-36 probe energy slope. Rank 36
+# continues to use normalized energy (RMS**2). After a squeeze, the trajectory
+# instead advances linearly in normalized RMS, equivalent to dE/dt proportional
+# to E**0.5.
+COMPRESSED_RMS_VELOCITY_FEATURE_MEANS = (
+    0.007285270580277961,
+    -10.168245390273446,
+    1.7122282014040486,
+    2.0677277940186394,
 )
-ENERGY_LATER_SLOPE_FEATURE_SCALES = (
-    0.00195696007833022,
-    0.08642769120993572,
-    0.3199760686203472,
-    0.06425220748273942,
+COMPRESSED_RMS_VELOCITY_FEATURE_SCALES = (
+    0.002251344133060875,
+    0.08086044962791163,
+    0.3120699200860747,
+    0.06381970974562814,
 )
-ENERGY_LATER_SLOPE_INTERCEPT = 1.0828790565322866
-ENERGY_LATER_SLOPE_COEFFICIENTS = (
-    0.2762064931350287,
-    -0.22353140512474973,
-    0.205567761186565,
-    -0.10745716122707656,
+COMPRESSED_RMS_VELOCITY_INTERCEPT = 0.3265441038920146
+COMPRESSED_RMS_VELOCITY_COEFFICIENTS = (
+    0.05996261144417287,
+    -0.033096682610793265,
+    0.04755607424244868,
+    -0.002938469988134204,
 )
-ENERGY_STAGE_FACTORS = (0.84333973, 0.95492410, 1.08152779, 1.12020838)
-ENERGY_SQUEEZE_RETENTION = (0.93776704, 0.91973453, 0.89532405, 0.86626541)
+# Relative four-squeeze stage factors, not absolute-rank keys. This keeps the
+# state equation independent of the literal 25/18/13/9 rank names.
+COMPRESSED_RMS_STAGE_FACTORS = (
+    0.9488115370411749,
+    0.9883579070426027,
+    1.0352879483439916,
+    1.0275426075722307,
+)
+# Family-weighted means from the twenty-two trajectories with retained-energy
+# telemetry. M'rissi predates that telemetry; Rosine keeps its double share.
+ENERGY_SQUEEZE_RETENTION = (
+    0.9312360825813657,
+    0.9204074869499388,
+    0.903277786425418,
+    0.8702080183754693,
+)
 ADJUSTED_PROBE_MIN_POST_SQUEEZE_SAMPLES = 5
 
 # Within-dataset log-log fits from matched Anima rank-36 trajectories. Six
@@ -754,7 +771,7 @@ def fit_adjusted_probe_rank36_transfer(
     }
 
 
-def fit_observed_later_mean_energy_slope(
+def fit_observed_later_mean_rms_velocity(
     rms_curve: Sequence[Tuple[int, float]],
     total_steps: int,
     probe_steps: int,
@@ -763,7 +780,7 @@ def fit_observed_later_mean_energy_slope(
     first_segment_ratio: float = 1.0,
     final_segment_ratio: float = 1.0,
 ) -> Tuple[float | None, Dict[str, float]]:
-    """Estimate the calibrated later-stage base slope without crossing squeezes."""
+    """Estimate normalized compressed-stage RMS velocity without crossing squeezes."""
 
     if not math.isfinite(reference_rms) or reference_rms <= 0:
         raise ValueError("reference_rms must be a finite value greater than 0")
@@ -775,7 +792,7 @@ def fit_observed_later_mean_energy_slope(
         final_segment_ratio,
     )
     boundaries = (0, *squeeze_steps, total_steps)
-    weighted_slopes = []
+    weighted_velocities = []
     details: Dict[str, float] = {
         "first_segment_ratio": float(first_segment_ratio),
         "final_segment_ratio": float(final_segment_ratio),
@@ -798,45 +815,52 @@ def fit_observed_later_mean_energy_slope(
         if any(not math.isfinite(rms) or rms <= 0 for _, rms in samples):
             raise ValueError("RMS probe curve contains a non-finite or zero RMS")
         xs = [float(step) for step, _ in samples]
-        ys = [(rms / reference_rms) ** 2 for _, rms in samples]
+        ys = [rms / reference_rms for _, rms in samples]
         x_mean = sum(xs) / len(xs)
         y_mean = sum(ys) / len(ys)
         denominator = sum((x - x_mean) ** 2 for x in xs)
         if denominator <= 0:
             continue
-        raw_slope = (
+        raw_velocity = (
             sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
             / denominator
             * 1000.0
         )
-        if not math.isfinite(raw_slope) or raw_slope <= 0:
+        if not math.isfinite(raw_velocity) or raw_velocity <= 0:
             continue
-        base_slope = raw_slope / ENERGY_STAGE_FACTORS[segment_index - 1]
+        base_velocity = (
+            raw_velocity / COMPRESSED_RMS_STAGE_FACTORS[segment_index - 1]
+        )
         observed_span = xs[-1] - xs[0]
         if observed_span <= 0:
             continue
-        weighted_slopes.append((base_slope, observed_span))
-        details[f"observed_stage_{segment_index}_base_slope"] = base_slope
+        weighted_velocities.append((base_velocity, observed_span))
+        details[
+            f"observed_stage_{segment_index}_base_rms_velocity"
+        ] = base_velocity
         details[f"observed_stage_{segment_index}_span"] = observed_span
 
-    if not weighted_slopes:
+    if not weighted_velocities:
         details["observed_later_stage_count"] = 0.0
         return None, details
-    total_weight = sum(weight for _, weight in weighted_slopes)
-    later_mean_slope = sum(slope * weight for slope, weight in weighted_slopes) / total_weight
-    details["observed_later_stage_count"] = float(len(weighted_slopes))
+    total_weight = sum(weight for _, weight in weighted_velocities)
+    later_mean_velocity = (
+        sum(velocity * weight for velocity, weight in weighted_velocities)
+        / total_weight
+    )
+    details["observed_later_stage_count"] = float(len(weighted_velocities))
     details["observed_later_stage_span"] = total_weight
-    details["observed_later_mean_energy_slope"] = later_mean_slope
-    return later_mean_slope, details
+    details["observed_later_mean_rms_velocity"] = later_mean_velocity
+    return later_mean_velocity, details
 
 
-def estimate_augmented_later_mean_energy_slope(
+def estimate_augmented_later_mean_rms_velocity(
     dataset_batches_per_epoch: int,
     observed_rms: float,
     gradient_accumulation_steps: int,
     probe_energy_slope: float,
 ) -> float:
-    """Estimate later growth with the augmented regression."""
+    """Estimate normalized compressed-stage RMS velocity with the regression."""
 
     if dataset_batches_per_epoch <= 0:
         raise ValueError("dataset_batches_per_epoch must be greater than 0")
@@ -857,22 +881,22 @@ def estimate_augmented_later_mean_energy_slope(
         (feature - mean) / scale
         for feature, mean, scale in zip(
             features,
-            ENERGY_LATER_SLOPE_FEATURE_MEANS,
-            ENERGY_LATER_SLOPE_FEATURE_SCALES,
+            COMPRESSED_RMS_VELOCITY_FEATURE_MEANS,
+            COMPRESSED_RMS_VELOCITY_FEATURE_SCALES,
         )
     )
-    later_mean_slope = ENERGY_LATER_SLOPE_INTERCEPT + sum(
+    later_mean_velocity = COMPRESSED_RMS_VELOCITY_INTERCEPT + sum(
         coefficient * feature
         for coefficient, feature in zip(
-            ENERGY_LATER_SLOPE_COEFFICIENTS,
+            COMPRESSED_RMS_VELOCITY_COEFFICIENTS,
             standardized_features,
         )
     )
-    if not math.isfinite(later_mean_slope) or later_mean_slope <= 0:
+    if not math.isfinite(later_mean_velocity) or later_mean_velocity <= 0:
         raise ValueError(
-            "augmented later-stage energy slope is non-positive for the supplied inputs"
+            "augmented compressed-stage RMS velocity is non-positive for the supplied inputs"
         )
-    return later_mean_slope
+    return later_mean_velocity
 
 
 def predict_piecewise_energy_final_rms(
@@ -882,11 +906,11 @@ def predict_piecewise_energy_final_rms(
     dataset_batches_per_epoch: int,
     probe_energy_slope: float,
     gradient_accumulation_steps: int,
-    later_mean_energy_slope: float | None = None,
+    later_mean_rms_velocity: float | None = None,
     first_segment_ratio: float = 1.0,
     final_segment_ratio: float = 1.0,
 ) -> float:
-    """Predict final RMS for the calibrated ratio-adjusted equal schedule."""
+    """Predict final RMS with rank-36 energy and compressed-stage RMS velocity."""
 
     if total_steps < 5:
         raise ValueError("piecewise energy prediction requires at least 5 total steps")
@@ -915,30 +939,33 @@ def predict_piecewise_energy_final_rms(
     )
     if not math.isfinite(energy) or energy <= 0:
         raise ValueError("piecewise energy prediction produced non-positive first-segment energy")
-    later_mean_slope = later_mean_energy_slope
-    if later_mean_slope is None:
-        later_mean_slope = estimate_augmented_later_mean_energy_slope(
+    later_mean_velocity = later_mean_rms_velocity
+    if later_mean_velocity is None:
+        later_mean_velocity = estimate_augmented_later_mean_rms_velocity(
             dataset_batches_per_epoch,
             observed_rms,
             gradient_accumulation_steps,
             probe_energy_slope,
         )
-    if not math.isfinite(later_mean_slope) or later_mean_slope <= 0:
-        raise ValueError("later_mean_energy_slope must be a finite value greater than 0")
+    if not math.isfinite(later_mean_velocity) or later_mean_velocity <= 0:
+        raise ValueError("later_mean_rms_velocity must be a finite value greater than 0")
+    rms = math.sqrt(energy)
     for stage_factor, retention, stage_steps in zip(
-        ENERGY_STAGE_FACTORS,
+        COMPRESSED_RMS_STAGE_FACTORS,
         ENERGY_SQUEEZE_RETENTION,
         segment_steps[1:],
     ):
-        energy *= retention
-        energy += (
-            probe_energy
-            * later_mean_slope
+        rms *= math.sqrt(retention)
+        rms += (
+            observed_rms
+            * later_mean_velocity
             * stage_factor
             * stage_steps
             / 1000.0
         )
-    return math.sqrt(max(0.0, energy))
+    if not math.isfinite(rms) or rms <= 0:
+        raise ValueError("piecewise energy prediction produced a non-positive final RMS")
+    return rms
 
 
 def estimate_piecewise_energy_adjusted_steps(
@@ -950,11 +977,11 @@ def estimate_piecewise_energy_adjusted_steps(
     rms_curve: Sequence[Tuple[int, float]],
     gradient_accumulation_steps: int,
     probe_energy_slope: float | None = None,
-    later_mean_energy_slope: float | None = None,
+    later_mean_rms_velocity: float | None = None,
     first_segment_ratio: float = 1.0,
     final_segment_ratio: float = 1.0,
 ) -> Tuple[int, float, Dict[str, float]]:
-    """Solve the calibrated RMS-squared trajectory for the requested final RMS."""
+    """Solve the calibrated hybrid trajectory for the requested final RMS."""
 
     if original_steps <= 0:
         raise ValueError("original_steps must be greater than 0")
@@ -989,7 +1016,7 @@ def estimate_piecewise_energy_adjusted_steps(
         dataset_batches_per_epoch,
         slope,
         gradient_accumulation_steps,
-        later_mean_energy_slope,
+        later_mean_rms_velocity,
         first_segment_ratio,
         final_segment_ratio,
     )
@@ -1006,7 +1033,7 @@ def estimate_piecewise_energy_adjusted_steps(
         dataset_batches_per_epoch,
         slope,
         gradient_accumulation_steps,
-        later_mean_energy_slope,
+        later_mean_rms_velocity,
         first_segment_ratio,
         final_segment_ratio,
     ) < final_target_rms:
@@ -1023,7 +1050,7 @@ def estimate_piecewise_energy_adjusted_steps(
             dataset_batches_per_epoch,
             slope,
             gradient_accumulation_steps,
-            later_mean_energy_slope,
+            later_mean_rms_velocity,
             first_segment_ratio,
             final_segment_ratio,
         )
@@ -1041,7 +1068,9 @@ def estimate_piecewise_energy_adjusted_steps(
     details = {
         "probe_energy_slope_per_1000_steps": slope,
         "dataset_batches_per_epoch": float(dataset_batches_per_epoch),
-        "later_mean_energy_slope_gradient_accumulation_steps": float(
+        "trajectory_model_version": TRAJECTORY_MODEL_VERSION,
+        "later_energy_exponent": LATER_ENERGY_EXPONENT,
+        "later_mean_rms_velocity_gradient_accumulation_steps": float(
             gradient_accumulation_steps
         ),
         "first_segment_ratio": float(first_segment_ratio),
@@ -1050,18 +1079,16 @@ def estimate_piecewise_energy_adjusted_steps(
             f"segment_{index}_steps": float(segment_steps)
             for index, segment_steps in enumerate(adjusted_segment_steps, start=1)
         },
-        "later_mean_energy_slope_is_observed": float(
-            later_mean_energy_slope is not None
+        "later_mean_rms_velocity_is_observed": float(
+            later_mean_rms_velocity is not None
         ),
-        "later_mean_energy_slope_uses_augmented_regression": float(
-            later_mean_energy_slope is None
+        "later_mean_rms_velocity_uses_augmented_regression": float(
+            later_mean_rms_velocity is None
         ),
-        # Retained in result JSON for compatibility with existing analysis tools.
-        "later_mean_energy_slope_uses_legacy_fallback": 0.0,
-        "later_mean_energy_slope_per_1000_steps": (
-            later_mean_energy_slope
-            if later_mean_energy_slope is not None
-            else estimate_augmented_later_mean_energy_slope(
+        "later_mean_rms_velocity_per_1000_steps": (
+            later_mean_rms_velocity
+            if later_mean_rms_velocity is not None
+            else estimate_augmented_later_mean_rms_velocity(
                 dataset_batches_per_epoch,
                 observed_rms,
                 gradient_accumulation_steps,
@@ -1075,7 +1102,7 @@ def estimate_piecewise_energy_adjusted_steps(
             dataset_batches_per_epoch,
             slope,
             gradient_accumulation_steps,
-            later_mean_energy_slope,
+            later_mean_rms_velocity,
             first_segment_ratio,
             final_segment_ratio,
         ),
@@ -1106,7 +1133,7 @@ def update_piecewise_production_prediction(
         dataset_batches_per_epoch,
         model_details["probe_energy_slope_per_1000_steps"],
         gradient_accumulation_steps,
-        model_details["later_mean_energy_slope_per_1000_steps"],
+        model_details["later_mean_rms_velocity_per_1000_steps"],
         first_segment_ratio,
         final_segment_ratio,
     )
@@ -1255,8 +1282,8 @@ def estimate_piecewise_training_plan(
     gradient_accumulation_rounding_bias: float = 0.6,
     adjusted_steps_divisible_by: int | None = None,
     probe_energy_slope: float | None = None,
-    later_mean_energy_slope: float | None = None,
-    later_mean_energy_slope_reference_gradient_accumulation_steps: int | None = None,
+    later_mean_rms_velocity: float | None = None,
+    later_mean_rms_velocity_reference_gradient_accumulation_steps: int | None = None,
     first_segment_ratio: float = 1.0,
     final_segment_ratio: float = 1.0,
 ) -> Tuple[int, float, int, int, int, Dict[str, float]]:
@@ -1289,28 +1316,29 @@ def estimate_piecewise_training_plan(
             probe_gradient_accumulation_steps,
             model_gradient_accumulation_steps,
         )
-        model_later_mean_energy_slope = later_mean_energy_slope
-        later_slope_accumulation_scale = 1.0
+        model_later_mean_rms_velocity = later_mean_rms_velocity
+        later_velocity_accumulation_scale = 1.0
         if (
-            later_mean_energy_slope is not None
-            and later_mean_energy_slope_reference_gradient_accumulation_steps is not None
+            later_mean_rms_velocity is not None
+            and later_mean_rms_velocity_reference_gradient_accumulation_steps
+            is not None
         ):
-            reference_later_slope = estimate_augmented_later_mean_energy_slope(
+            reference_later_velocity = estimate_augmented_later_mean_rms_velocity(
                 dataset_batches_per_epoch,
                 observed_rms,
-                later_mean_energy_slope_reference_gradient_accumulation_steps,
+                later_mean_rms_velocity_reference_gradient_accumulation_steps,
                 reference_probe_energy_slope,
             )
-            modeled_later_slope = estimate_augmented_later_mean_energy_slope(
+            modeled_later_velocity = estimate_augmented_later_mean_rms_velocity(
                 dataset_batches_per_epoch,
                 production_reference_rms,
                 model_gradient_accumulation_steps,
                 production_probe_energy_slope,
             )
-            later_slope_accumulation_scale = (
-                modeled_later_slope / reference_later_slope
+            later_velocity_accumulation_scale = (
+                modeled_later_velocity / reference_later_velocity
             )
-            model_later_mean_energy_slope *= later_slope_accumulation_scale
+            model_later_mean_rms_velocity *= later_velocity_accumulation_scale
         estimated_steps, step_multiplier, model_details = (
             estimate_piecewise_energy_adjusted_steps(
                 original_steps=original_steps,
@@ -1321,26 +1349,26 @@ def estimate_piecewise_training_plan(
                 rms_curve=rms_curve,
                 gradient_accumulation_steps=model_gradient_accumulation_steps,
                 probe_energy_slope=production_probe_energy_slope,
-                later_mean_energy_slope=model_later_mean_energy_slope,
+                later_mean_rms_velocity=model_later_mean_rms_velocity,
                 first_segment_ratio=first_segment_ratio,
                 final_segment_ratio=final_segment_ratio,
             )
         )
         model_details.update(probe_accumulation_details)
-        if later_mean_energy_slope is not None:
+        if later_mean_rms_velocity is not None:
             model_details.update(
                 {
-                    "observed_later_mean_energy_slope_at_probe_accumulation": (
-                        later_mean_energy_slope
+                    "observed_later_mean_rms_velocity_at_probe_accumulation": (
+                        later_mean_rms_velocity
                     ),
-                    "observed_later_mean_energy_slope_probe_gradient_accumulation_steps": (
+                    "observed_later_mean_rms_velocity_probe_gradient_accumulation_steps": (
                         float(
-                            later_mean_energy_slope_reference_gradient_accumulation_steps
+                            later_mean_rms_velocity_reference_gradient_accumulation_steps
                             or model_gradient_accumulation_steps
                         )
                     ),
-                    "observed_later_mean_energy_slope_accumulation_scale": (
-                        later_slope_accumulation_scale
+                    "observed_later_mean_rms_velocity_accumulation_scale": (
+                        later_velocity_accumulation_scale
                     ),
                 }
             )
@@ -1406,7 +1434,7 @@ def estimate_piecewise_training_plan(
 
     raise ValueError(
         "RMS probe could not find a stable step and gradient-accumulation "
-        "combination for the augmented energy model"
+        "combination for the hybrid trajectory model"
     )
 
 
