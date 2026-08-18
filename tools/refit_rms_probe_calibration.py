@@ -22,7 +22,63 @@ CROSSBREED_STAGE_SHAPES = np.asarray(
     )
 )
 CROSSBREED_STAGE_SHAPE = np.mean(CROSSBREED_STAGE_SHAPES, axis=0)
-STAGE_FACTORS = tuple((6.0 * PRIOR_STAGE_FACTORS + CROSSBREED_STAGE_SHAPE) / 7.0)
+MARCIA_STAGE_VELOCITIES = np.asarray(
+    (
+        # 1,550-step and 2,400-step completed GA-5 schedules, followed by
+        # the 1,700-step GA-11 and 2,000-step GA-9 schedules.
+        (2.400155e-8, 2.210202e-8, 2.322872e-8, 2.293994e-8),
+        (
+            2.312615460080274e-8,
+            2.232675674906793e-8,
+            2.4164681436872227e-8,
+            2.6087100878601762e-8,
+        ),
+        (
+            3.253366551635898e-8,
+            3.419089968220384e-8,
+            3.5470268224290684e-8,
+            4.003662444815488e-8,
+        ),
+        (
+            2.772597757652157e-8,
+            2.9396111418272515e-8,
+            3.026081558026929e-8,
+            3.3129234859523805e-8,
+        ),
+    )
+)
+MARCIA_STAGE_SHAPES = MARCIA_STAGE_VELOCITIES / np.mean(
+    MARCIA_STAGE_VELOCITIES,
+    axis=1,
+    keepdims=True,
+)
+MARCIA_STAGE_SHAPE = np.mean(MARCIA_STAGE_SHAPES, axis=0)
+BEASTGIRL_STAGE_SHAPES = np.asarray(
+    (
+        (
+            0.9751315362180831,
+            0.9268944353291072,
+            1.0442107351508483,
+            1.0537632933019614,
+        ),
+        (
+            0.860464886024853,
+            0.9740218504766431,
+            1.0525559010097465,
+            1.1129573624887577,
+        ),
+    )
+)
+BEASTGIRL_STAGE_SHAPE = np.mean(BEASTGIRL_STAGE_SHAPES, axis=0)
+STAGE_FACTORS = tuple(
+    (
+        6.0 * PRIOR_STAGE_FACTORS
+        + CROSSBREED_STAGE_SHAPE
+        + MARCIA_STAGE_SHAPE
+        + BEASTGIRL_STAGE_SHAPE
+    )
+    / 9.0
+)
 
 # Per-family means of retained_energy_mean. M'rissi predates this telemetry.
 RETENTION_FAMILY_MEANS = {
@@ -41,6 +97,22 @@ RETENTION_FAMILY_MEANS = {
             np.mean((0.8675388693809509, 0.8682758212089539)),
         )
     ),
+    "marcia": np.asarray(
+        (
+            np.mean((0.9397159218788147, 0.9446578025817871, 0.9477311372756958, 0.9459108114242554)),
+            np.mean((0.931081235408783, 0.9350574016571045, 0.938911497592926, 0.9370183348655701)),
+            np.mean((0.9144988656044006, 0.9179385900497437, 0.9211618900299072, 0.9195295572280884)),
+            np.mean((0.8838304877281189, 0.8856008052825928, 0.8903316855430603, 0.8870620727539062)),
+        )
+    ),
+    "beastgirl": np.asarray(
+        (
+            np.mean((0.9472075700759888, 0.953414797782898)),
+            np.mean((0.9393881559371948, 0.9455373883247375)),
+            np.mean((0.924223780632019, 0.9300624132156372)),
+            np.mean((0.8950448036193848, 0.8998176455497742)),
+        )
+    ),
 }
 SQUEEZE_RETENTION = tuple(
     (
@@ -50,8 +122,10 @@ SQUEEZE_RETENTION = tuple(
         + RETENTION_FAMILY_MEANS["mutio"]
         + 2.0 * RETENTION_FAMILY_MEANS["rosine"]
         + RETENTION_FAMILY_MEANS["crossbreed_priscilla"]
+        + RETENTION_FAMILY_MEANS["marcia"]
+        + RETENTION_FAMILY_MEANS["beastgirl"]
     )
-    / 7.0
+    / 9.0
 )
 FAMILY_SHARES = {
     "mrissi": 1.0,
@@ -61,6 +135,8 @@ FAMILY_SHARES = {
     "mutio": 1.0,
     "rosine": 2.0,
     "crossbreed_priscilla": 1.0,
+    "marcia": 1.0,
+    "beastgirl": 1.0,
 }
 
 
@@ -102,6 +178,31 @@ ROWS = (
     CalibrationRow("crossbreed_priscilla", 93, 3.858837416025104e-5, 7, 2.126722772584375, 3300, 7.7368463526e-5),
     # The second run probed and trained at GA 7, so no GA transfer is needed.
     CalibrationRow("crossbreed_priscilla", 93, 3.842611053225904e-5, 7, 2.0053641727895593, 3700, 8.623025450275907e-5),
+    # Same-GA schedule-aware Probe-1 views from the completed 1,550-, 2,400-,
+    # 1,700-, and 2,000-step Marcia trajectories. They split one family share.
+    CalibrationRow("marcia", 22, 4.7060277489e-5, 5, 2.1234049812, 1550, 5.9780546789e-5),
+    CalibrationRow("marcia", 22, 5.0705232640351776e-5, 5, 2.1984010211552754, 2400, 8.776551913866043e-5),
+    CalibrationRow("marcia", 22, 6.54549402987649e-5, 11, 2.306234594209267, 1700, 9.212609184623723e-5),
+    CalibrationRow("marcia", 27, 5.4083582557090604e-5, 9, 2.17195124877972, 2000, 9.194107419552754e-5),
+    # Same-GA schedule-aware views of the completed Beastgirl trajectories.
+    CalibrationRow(
+        "beastgirl",
+        15,
+        5.019000006813414e-5,
+        4,
+        2.1833027981860034,
+        2200,
+        8.158656763806009e-5,
+    ),
+    CalibrationRow(
+        "beastgirl",
+        22,
+        6.370470275181598e-5,
+        11,
+        2.2177239901442296,
+        1600,
+        8.717409915077944e-5,
+    ),
 )
 
 
@@ -130,7 +231,7 @@ def endpoint_velocity(row: CalibrationRow) -> float:
 def features(row: CalibrationRow) -> np.ndarray:
     return np.asarray(
         (
-            1.0 / row.batches_per_epoch,
+            math.log(row.batches_per_epoch),
             math.log(row.reference_rms),
             math.log(row.production_ga),
             row.early_energy_slope,

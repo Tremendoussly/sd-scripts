@@ -10,53 +10,54 @@ PIECEWISE_ENERGY_POLICY = "piecewise_energy_v1"
 SCALING_POLICIES = (LINEAR_POLICY, PIECEWISE_ENERGY_POLICY)
 CALIBRATION_PROBE_STEPS = 500
 PROBE_ENERGY_FIT_START_STEP = 100
-TRAJECTORY_MODEL_VERSION = 2.0
+TRAJECTORY_MODEL_VERSION = 2.5
 LATER_ENERGY_EXPONENT = 0.5
 
-# Calibrated from twenty-three Anima 36->9, four-squeeze runs across M'rissi,
-# Izutsumi, Neeko, Wilykit, Mutio, Rosine, and Crossbreed Priscilla. Rosine has
+# Calibrated from twenty-nine Anima 36->9, four-squeeze runs across M'rissi,
+# Izutsumi, Neeko, Wilykit, Mutio, Rosine, Crossbreed Priscilla, Marcia, and
+# Beastgirl. Rosine has
 # twice the total family weight because its ten runs intentionally span
 # substantial dataset revisions; each other family has one equal share.
 # Repeated runs divide their family's weight. The compressed-stage regression
-# uses standardized inverse batches per epoch, log probe RMS, log production
+# uses standardized log batches per epoch, log probe RMS, log production
 # gradient accumulation, and normalized rank-36 probe energy slope. Rank 36
 # continues to use normalized energy (RMS**2). After a squeeze, the trajectory
 # instead advances linearly in normalized RMS, equivalent to dE/dt proportional
 # to E**0.5.
 COMPRESSED_RMS_VELOCITY_FEATURE_MEANS = (
-    0.007285270580277961,
-    -10.168245390273446,
-    1.7122282014040486,
-    2.0677277940186394,
+    4.582216222074689,
+    -10.095460938251572,
+    1.7543419346942222,
+    2.0942333707650294,
 )
 COMPRESSED_RMS_VELOCITY_FEATURE_SCALES = (
-    0.002251344133060875,
-    0.08086044962791163,
-    0.3120699200860747,
-    0.06381970974562814,
+    0.8371302720401558,
+    0.17161965209933952,
+    0.35088098288465436,
+    0.0809118489347005,
 )
-COMPRESSED_RMS_VELOCITY_INTERCEPT = 0.3265441038920146
+COMPRESSED_RMS_VELOCITY_INTERCEPT = 0.3727373374694527
 COMPRESSED_RMS_VELOCITY_COEFFICIENTS = (
-    0.05996261144417287,
-    -0.033096682610793265,
-    0.04755607424244868,
-    -0.002938469988134204,
+    -0.1384855275828175,
+    -0.037473502598478,
+    0.0609705418058367,
+    -0.01836699122446701,
 )
 # Relative four-squeeze stage factors, not absolute-rank keys. This keeps the
 # state equation independent of the literal 25/18/13/9 rank names.
 COMPRESSED_RMS_STAGE_FACTORS = (
-    0.9488115370411749,
-    0.9883579070426027,
-    1.0352879483439916,
-    1.0275426075722307,
+    0.9466713170779468,
+    0.9806775307817711,
+    1.0333464658915648,
+    1.0393046862487172,
 )
-# Family-weighted means from the twenty-two trajectories with retained-energy
+# Family-weighted means from the twenty-eight trajectories with retained-energy
 # telemetry. M'rissi predates that telemetry; Rosine keeps its double share.
 ENERGY_SQUEEZE_RETENTION = (
-    0.9312360825813657,
-    0.9204074869499388,
-    0.903277786425418,
-    0.8702080183754693,
+    0.934829742254349,
+    0.9245369220179592,
+    0.907596647514421,
+    0.8750659573377538,
 )
 ADJUSTED_PROBE_MIN_POST_SQUEEZE_SAMPLES = 5
 
@@ -141,30 +142,31 @@ def validate_rms_probe_configuration(args: argparse.Namespace) -> bool:
             raise ValueError("--rms_probe_curve_every_n_steps must be greater than 0")
         periodic_curve_steps = set(range(curve_interval, steps + 1, curve_interval))
         periodic_curve_steps.add(steps)
-        fit_sample_steps = [
+        first_squeeze_step = squeeze_schedule_steps(
+            args.max_train_steps,
+            first_segment_ratio,
+            final_segment_ratio,
+        )[0]
+        rank36_fit_start_step = (
+            PROBE_ENERGY_FIT_START_STEP
+            if first_squeeze_step > steps
+            else curve_interval
+        )
+        rank36_fit_sample_steps = [
             step
             for step in periodic_curve_steps
-            if step >= PROBE_ENERGY_FIT_START_STEP
+            if rank36_fit_start_step <= step < first_squeeze_step
         ]
-        if len(fit_sample_steps) < 2:
+        if len(rank36_fit_sample_steps) < 2:
             raise ValueError(
-                "piecewise_energy_v1 needs at least two RMS curve samples at or after "
-                f"step {PROBE_ENERGY_FIT_START_STEP}; increase --rms_probe_steps or "
-                "decrease --rms_probe_curve_every_n_steps"
+                "piecewise_energy_v1 needs at least two rank-36 RMS curve samples "
+                "before squeeze one; increase --max_train_steps, decrease "
+                "--rms_probe_curve_every_n_steps, or adjust the squeeze segment ratios"
             )
         if final_target is None or not math.isfinite(final_target) or final_target <= 0:
             raise ValueError(
                 "--rms_probe_final_target must be a finite value greater than 0 for piecewise_energy_v1"
             )
-        if (
-            squeeze_schedule_steps(
-                args.max_train_steps,
-                first_segment_ratio,
-                final_segment_ratio,
-            )[0]
-            <= steps
-        ):
-            raise ValueError("piecewise_energy_v1 requires the first squeeze to occur after the probe")
         expected = {
             "lora_squeeze_start_dim": 36,
             "network_dim": 9,
@@ -444,16 +446,20 @@ def should_run_adjusted_probe(
     force_adjusted_probe: bool = False,
     first_segment_ratio: float = 1.0,
     final_segment_ratio: float = 1.0,
+    has_observed_compressed_stage_evidence: bool = False,
 ) -> bool:
-    """Whether Probe 2 should run because the schedule requires it or it was forced."""
+    """Whether Probe 2 adds missing schedule evidence or was explicitly forced."""
 
     return scaling_policy == PIECEWISE_ENERGY_POLICY and (
         force_adjusted_probe
-        or probe_schedule_needs_adjusted_probe(
-            total_steps,
-            probe_steps,
-            first_segment_ratio,
-            final_segment_ratio,
+        or (
+            not has_observed_compressed_stage_evidence
+            and probe_schedule_needs_adjusted_probe(
+                total_steps,
+                probe_steps,
+                first_segment_ratio,
+                final_segment_ratio,
+            )
         )
     )
 
@@ -658,6 +664,7 @@ def fit_adjusted_probe_rank36_transfer(
     primary_probe_energy_slope: float,
     first_segment_ratio: float = 1.0,
     final_segment_ratio: float = 1.0,
+    primary_total_steps: int | None = None,
 ) -> Tuple[float, float, Dict[str, float]]:
     """Transfer Probe 1's long rank-36 fit using Probe 2's shared early window.
 
@@ -670,6 +677,8 @@ def fit_adjusted_probe_rank36_transfer(
 
     if adjusted_total_steps <= 0 or adjusted_probe_steps <= 0:
         raise ValueError("adjusted probe and production steps must be greater than 0")
+    if primary_total_steps is not None and primary_total_steps <= 0:
+        raise ValueError("primary_total_steps must be greater than 0 when supplied")
     if not math.isfinite(primary_reference_rms) or primary_reference_rms <= 0:
         raise ValueError("primary_reference_rms must be finite and greater than 0")
     if (
@@ -680,17 +689,30 @@ def fit_adjusted_probe_rank36_transfer(
             "primary_probe_energy_slope must be finite and greater than 0"
         )
 
-    first_squeeze_step = squeeze_schedule_steps(
+    adjusted_first_squeeze_step = squeeze_schedule_steps(
         adjusted_total_steps,
         first_segment_ratio,
         final_segment_ratio,
     )[0]
+    primary_first_squeeze_step = (
+        squeeze_schedule_steps(
+            primary_total_steps,
+            first_segment_ratio,
+            final_segment_ratio,
+        )[0]
+        if primary_total_steps is not None
+        else adjusted_first_squeeze_step
+    )
+    shared_rank36_end_step = min(
+        primary_first_squeeze_step,
+        adjusted_first_squeeze_step,
+    )
     primary_by_step = {int(step): float(rms) for step, rms in primary_rms_curve}
     adjusted_by_step = {int(step): float(rms) for step, rms in adjusted_rms_curve}
     shared_steps = sorted(
         step
         for step in primary_by_step.keys() & adjusted_by_step.keys()
-        if 0 < step <= adjusted_probe_steps and step < first_squeeze_step
+        if 0 < step <= adjusted_probe_steps and step < shared_rank36_end_step
     )
     if len(shared_steps) < 2:
         raise ValueError(
@@ -752,7 +774,13 @@ def fit_adjusted_probe_rank36_transfer(
         primary_probe_energy_slope * normalized_slope_scale
     )
     return transferred_reference_rms, transferred_probe_energy_slope, {
-        "rank36_transfer_first_squeeze_step": float(first_squeeze_step),
+        "rank36_transfer_first_squeeze_step": float(shared_rank36_end_step),
+        "rank36_transfer_primary_first_squeeze_step": float(
+            primary_first_squeeze_step
+        ),
+        "rank36_transfer_adjusted_first_squeeze_step": float(
+            adjusted_first_squeeze_step
+        ),
         "rank36_transfer_sample_count": float(len(shared_steps)),
         "rank36_transfer_first_sample_step": float(shared_steps[0]),
         "rank36_transfer_last_sample_step": float(shared_steps[-1]),
@@ -854,6 +882,142 @@ def fit_observed_later_mean_rms_velocity(
     return later_mean_velocity, details
 
 
+def rescale_observed_later_mean_rms_velocity(
+    later_mean_rms_velocity: float,
+    dataset_batches_per_epoch: int,
+    source_reference_rms: float,
+    source_gradient_accumulation_steps: int,
+    source_probe_energy_slope: float,
+    target_reference_rms: float,
+    target_gradient_accumulation_steps: int,
+    target_probe_energy_slope: float,
+) -> Tuple[float, Dict[str, float]]:
+    """Map an observed compressed-stage velocity to another probe condition."""
+
+    if not math.isfinite(later_mean_rms_velocity) or later_mean_rms_velocity <= 0:
+        raise ValueError(
+            "later_mean_rms_velocity must be a finite value greater than 0"
+        )
+    source_modeled_velocity = estimate_augmented_later_mean_rms_velocity(
+        dataset_batches_per_epoch,
+        source_reference_rms,
+        source_gradient_accumulation_steps,
+        source_probe_energy_slope,
+    )
+    target_modeled_velocity = estimate_augmented_later_mean_rms_velocity(
+        dataset_batches_per_epoch,
+        target_reference_rms,
+        target_gradient_accumulation_steps,
+        target_probe_energy_slope,
+    )
+    velocity_scale = target_modeled_velocity / source_modeled_velocity
+    rescaled_velocity = later_mean_rms_velocity * velocity_scale
+    return rescaled_velocity, {
+        "observed_later_velocity_condition_scale": velocity_scale,
+        "observed_later_velocity_source_modeled_value": source_modeled_velocity,
+        "observed_later_velocity_target_modeled_value": target_modeled_velocity,
+        "observed_later_velocity_rescaled_value": rescaled_velocity,
+    }
+
+
+def combine_observed_later_mean_rms_velocities(
+    observations: Sequence[Tuple[float | None, Dict[str, float]]],
+) -> Tuple[float | None, Dict[str, float]]:
+    """Span-weight compatible compressed-stage measurements from fresh probes."""
+
+    weighted_observations = []
+    details: Dict[str, float] = {}
+    for probe_index, (velocity, observation_details) in enumerate(
+        observations,
+        start=1,
+    ):
+        if velocity is None:
+            continue
+        span = float(observation_details.get("observed_later_stage_span", 0.0))
+        if (
+            not math.isfinite(velocity)
+            or velocity <= 0
+            or not math.isfinite(span)
+            or span <= 0
+        ):
+            raise ValueError(
+                "observed compressed-stage velocities need finite positive values and spans"
+            )
+        weighted_observations.append((float(velocity), span))
+        details[f"combined_observed_later_probe_{probe_index}_velocity"] = float(
+            velocity
+        )
+        details[f"combined_observed_later_probe_{probe_index}_span"] = span
+
+    if not weighted_observations:
+        details["combined_observed_later_probe_count"] = 0.0
+        return None, details
+    total_span = sum(span for _, span in weighted_observations)
+    combined_velocity = (
+        sum(velocity * span for velocity, span in weighted_observations)
+        / total_span
+    )
+    details.update(
+        {
+            "combined_observed_later_probe_count": float(
+                len(weighted_observations)
+            ),
+            "combined_observed_later_stage_span": total_span,
+            "combined_observed_later_mean_rms_velocity": combined_velocity,
+        }
+    )
+    return combined_velocity, details
+
+
+def combine_observed_squeeze_retentions(
+    retention_sets: Sequence[Sequence[float | None]],
+) -> Tuple[Tuple[float | None, ...], Dict[str, float]]:
+    """Combine matching squeeze stages across probes without shifting stage labels."""
+
+    if any(len(values) > len(ENERGY_SQUEEZE_RETENTION) for values in retention_sets):
+        raise ValueError(
+            "observed squeeze retention has more stages than the calibrated schedule"
+        )
+    stage_values = [[] for _ in ENERGY_SQUEEZE_RETENTION]
+    for values in retention_sets:
+        for stage_index, value in enumerate(values):
+            if value is None:
+                continue
+            if not math.isfinite(value) or value <= 0 or value > 1:
+                raise ValueError(
+                    "observed squeeze retention values must be finite and in (0, 1]"
+                )
+            stage_values[stage_index].append(float(value))
+
+    last_observed_stage = max(
+        (index for index, values in enumerate(stage_values, start=1) if values),
+        default=0,
+    )
+    combined = tuple(
+        sum(values) / len(values) if values else None
+        for values in stage_values[:last_observed_stage]
+    )
+    details: Dict[str, float] = {
+        "combined_squeeze_retention_stage_count": float(
+            sum(value is not None for value in combined)
+        ),
+        "combined_squeeze_retention_probe_count": float(
+            sum(
+                any(value is not None for value in values)
+                for values in retention_sets
+            )
+        ),
+    }
+    for stage_index, values in enumerate(stage_values, start=1):
+        if not values:
+            continue
+        details[f"combined_squeeze_{stage_index}_probe_count"] = float(len(values))
+        details[f"combined_squeeze_{stage_index}_retained_energy_mean"] = (
+            sum(values) / len(values)
+        )
+    return combined, details
+
+
 def estimate_augmented_later_mean_rms_velocity(
     dataset_batches_per_epoch: int,
     observed_rms: float,
@@ -872,7 +1036,7 @@ def estimate_augmented_later_mean_rms_velocity(
         raise ValueError("probe_energy_slope must be finite and greater than 0")
 
     features = (
-        1.0 / dataset_batches_per_epoch,
+        math.log(dataset_batches_per_epoch),
         math.log(observed_rms),
         math.log(gradient_accumulation_steps),
         probe_energy_slope,
@@ -899,6 +1063,39 @@ def estimate_augmented_later_mean_rms_velocity(
     return later_mean_velocity
 
 
+def fit_observed_squeeze_retention_scale(
+    observed_retentions: Sequence[float | None],
+) -> Tuple[float, Dict[str, float]]:
+    """Scale calibrated retention from matching stages observed by probe runs."""
+
+    if len(observed_retentions) > len(ENERGY_SQUEEZE_RETENTION):
+        raise ValueError(
+            "observed squeeze retention has more stages than the calibrated schedule"
+        )
+    ratios = []
+    details: Dict[str, float] = {}
+    for index, (observed, calibrated) in enumerate(
+        zip(observed_retentions, ENERGY_SQUEEZE_RETENTION),
+        start=1,
+    ):
+        if observed is None:
+            continue
+        if not math.isfinite(observed) or observed <= 0 or observed > 1:
+            raise ValueError(
+                "observed squeeze retention values must be finite and in (0, 1]"
+            )
+        ratios.append(observed / calibrated)
+        details[f"observed_squeeze_{index}_retained_energy_mean"] = float(observed)
+    scale = (
+        math.exp(sum(math.log(ratio) for ratio in ratios) / len(ratios))
+        if ratios
+        else 1.0
+    )
+    details["observed_squeeze_retention_count"] = float(len(ratios))
+    details["observed_squeeze_retention_scale"] = float(scale)
+    return scale, details
+
+
 def predict_piecewise_energy_final_rms(
     total_steps: int,
     probe_steps: int,
@@ -909,6 +1106,7 @@ def predict_piecewise_energy_final_rms(
     later_mean_rms_velocity: float | None = None,
     first_segment_ratio: float = 1.0,
     final_segment_ratio: float = 1.0,
+    squeeze_retention_scale: float = 1.0,
 ) -> float:
     """Predict final RMS with rank-36 energy and compressed-stage RMS velocity."""
 
@@ -924,6 +1122,8 @@ def predict_piecewise_energy_final_rms(
         raise ValueError("probe_energy_slope must be a finite value greater than 0")
     if gradient_accumulation_steps <= 0:
         raise ValueError("gradient_accumulation_steps must be greater than 0")
+    if not math.isfinite(squeeze_retention_scale) or squeeze_retention_scale <= 0:
+        raise ValueError("squeeze_retention_scale must be finite and greater than 0")
 
     probe_energy = observed_rms**2
     segment_steps = squeeze_segment_steps(
@@ -955,7 +1155,7 @@ def predict_piecewise_energy_final_rms(
         ENERGY_SQUEEZE_RETENTION,
         segment_steps[1:],
     ):
-        rms *= math.sqrt(retention)
+        rms *= math.sqrt(min(1.0, retention * squeeze_retention_scale))
         rms += (
             observed_rms
             * later_mean_velocity
@@ -980,6 +1180,7 @@ def estimate_piecewise_energy_adjusted_steps(
     later_mean_rms_velocity: float | None = None,
     first_segment_ratio: float = 1.0,
     final_segment_ratio: float = 1.0,
+    squeeze_retention_scale: float = 1.0,
 ) -> Tuple[int, float, Dict[str, float]]:
     """Solve the calibrated hybrid trajectory for the requested final RMS."""
 
@@ -1019,6 +1220,7 @@ def estimate_piecewise_energy_adjusted_steps(
         later_mean_rms_velocity,
         first_segment_ratio,
         final_segment_ratio,
+        squeeze_retention_scale,
     )
     if minimum_prediction > final_target_rms:
         raise ValueError(
@@ -1036,6 +1238,7 @@ def estimate_piecewise_energy_adjusted_steps(
         later_mean_rms_velocity,
         first_segment_ratio,
         final_segment_ratio,
+        squeeze_retention_scale,
     ) < final_target_rms:
         high *= 2
         if high > 100_000_000:
@@ -1053,6 +1256,7 @@ def estimate_piecewise_energy_adjusted_steps(
             later_mean_rms_velocity,
             first_segment_ratio,
             final_segment_ratio,
+            squeeze_retention_scale,
         )
         if predicted < final_target_rms:
             low = midpoint + 1
@@ -1075,6 +1279,7 @@ def estimate_piecewise_energy_adjusted_steps(
         ),
         "first_segment_ratio": float(first_segment_ratio),
         "final_segment_ratio": float(final_segment_ratio),
+        "squeeze_retention_scale": float(squeeze_retention_scale),
         **{
             f"segment_{index}_steps": float(segment_steps)
             for index, segment_steps in enumerate(adjusted_segment_steps, start=1)
@@ -1105,6 +1310,7 @@ def estimate_piecewise_energy_adjusted_steps(
             later_mean_rms_velocity,
             first_segment_ratio,
             final_segment_ratio,
+            squeeze_retention_scale,
         ),
     }
     return adjusted_steps, adjusted_steps / original_steps, details
@@ -1136,6 +1342,7 @@ def update_piecewise_production_prediction(
         model_details["later_mean_rms_velocity_per_1000_steps"],
         first_segment_ratio,
         final_segment_ratio,
+        model_details.get("squeeze_retention_scale", 1.0),
     )
     production_segment_steps = squeeze_segment_steps(
         production_steps,
@@ -1286,6 +1493,7 @@ def estimate_piecewise_training_plan(
     later_mean_rms_velocity_reference_gradient_accumulation_steps: int | None = None,
     first_segment_ratio: float = 1.0,
     final_segment_ratio: float = 1.0,
+    squeeze_retention_scale: float = 1.0,
 ) -> Tuple[int, float, int, int, int, Dict[str, float]]:
     """Select a stable piecewise step and gradient-accumulation plan."""
 
@@ -1352,6 +1560,7 @@ def estimate_piecewise_training_plan(
                 later_mean_rms_velocity=model_later_mean_rms_velocity,
                 first_segment_ratio=first_segment_ratio,
                 final_segment_ratio=final_segment_ratio,
+                squeeze_retention_scale=squeeze_retention_scale,
             )
         )
         model_details.update(probe_accumulation_details)
